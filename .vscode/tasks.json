@@ -1,0 +1,84 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "运行选股程序",
+      "type": "shell",
+      "command": "python main.py",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "安装依赖",
+      "type": "shell",
+      "command": "pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple",
+      "group": "build",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Docker 构建镜像",
+      "type": "shell",
+      "command": "docker build -t stock-selection .",
+      "group": "build",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Docker 运行选股",
+      "type": "shell",
+      "command": "docker run --rm -v ${workspaceFolder}/output:/app/output -v ${workspaceFolder}/cache:/app/cache stock-selection",
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "运行测试",
+      "type": "shell",
+      "command": "python -m pytest test/ -v",
+      "group": "test",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "清理缓存",
+      "type": "shell",
+      "command": "rm -rf cache/* __pycache__/*",
+      "group": "none",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
