@@ -8,7 +8,7 @@ venv/
 .env
 
 # runtime outputs and caches
-output/
+output/minute*
 cache/
 
 # Excel / WPS temp files

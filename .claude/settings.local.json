@@ -9,7 +9,9 @@
       "Bash(python backtest/advanced_backtest.py)",
       "mcp__ide__executeCode",
       "Bash(python *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(grep -v \"_bs\\\\.csv$\")",
+      "Bash(grep -c \"_bs\\\\.csv$\")"
     ]
   }
 }

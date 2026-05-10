@@ -7,6 +7,7 @@ from .daily_strategies import (
     ShrinkPullbackCounterStrategy,
     LimitUpShrinkReExpandStrategy,
     MAPinchBreakoutStrategy,
+    CustomBuySignalStrategy,
 )
 
 
@@ -19,6 +20,7 @@ def get_daily_strategies() -> list[BaseDailyStrategy]:
         ShrinkPullbackCounterStrategy(),      # N2  缩量回踩反击 53.01%  1天
         LimitUpShrinkReExpandStrategy(),      # N24 涨停缩量再放 52.48%  1天
         MAPinchBreakoutStrategy(),            # N5  均线粘合突破 52.39%  4天
+        CustomBuySignalStrategy(),   # 新增
     ]
 
 
