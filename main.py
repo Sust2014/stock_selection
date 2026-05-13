@@ -754,7 +754,7 @@ def run_daily():
                 index=False
             )
 
-    print_strategy_descriptions()
+    # print_strategy_descriptions()
 
     print_concept_resonance(resonance_summary_df)
 

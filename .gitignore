@@ -19,3 +19,6 @@ cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# config
+config.py

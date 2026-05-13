@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import tushare as ts; help\\(ts.get_realtime_quotes\\)\")",
+      "Bash(python -c \"import tushare as ts; print\\('tushare version:', ts.__version__\\); funcs = [x for x in dir\\(ts\\) if 'real' in x.lower\\(\\) or 'money' in x.lower\\(\\) or 'fund' in x.lower\\(\\) or 'flow' in x.lower\\(\\) or 'tick' in x.lower\\(\\) or 'min' in x.lower\\(\\)]; print\\('\\\\nrelevant functions in tushare main:'\\); [print\\(f'  {f}'\\) for f in funcs]\")"
+    ]
+  }
+}

@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from collections import deque
 import pandas as pd
 from wcwidth import wcswidth
 import tushare as ts
@@ -14,6 +15,171 @@ DEFAULT_MINUTE_DAYS = 5
 
 _TUSHARE_PRO = None
 _TUSHARE_PRO_LOCK = threading.Lock()
+
+# rt_min 接口限制：每分钟最多 50 次请求。
+# 这里默认控制在 45 次/分钟，留一点余量，避免多线程并发时触发限流。
+RT_MIN_MAX_CALLS_PER_MINUTE = int(os.getenv("RT_MIN_MAX_CALLS_PER_MINUTE", "45"))
+_RT_MIN_CALL_TIMES = deque()
+_RT_MIN_RATE_LOCK = threading.Lock()
+
+# stk_mins 盘后历史分钟接口限速。
+# 官方没有给出固定的每分钟次数，这里默认 80 次/分钟，可通过环境变量调整。
+# 如果仍出现“您请求速度过快”，把环境变量调低，例如 60；如果想更快可以试 100。
+STK_MINS_MAX_CALLS_PER_MINUTE = int(os.getenv("STK_MINS_MAX_CALLS_PER_MINUTE", "80"))
+STK_MINS_RETRY_TIMES = int(os.getenv("STK_MINS_RETRY_TIMES", "3"))
+STK_MINS_RETRY_SLEEP_SECONDS = float(os.getenv("STK_MINS_RETRY_SLEEP_SECONDS", "10"))
+_STK_MINS_CALL_TIMES = deque()
+_STK_MINS_RATE_LOCK = threading.Lock()
+
+# 控制台单行刷新锁，避免多线程限速提示互相抢打印，导致不断往下刷屏。
+_CONSOLE_PRINT_LOCK = threading.Lock()
+_CONSOLE_LINE_WIDTH = 180
+
+
+def print_same_line(message: str):
+    """在控制台原地刷新一行，不换行。"""
+    with _CONSOLE_PRINT_LOCK:
+        text = str(message)
+        print("\r" + text.ljust(_CONSOLE_LINE_WIDTH), end="\r", flush=True)
+
+
+# 盘后校准进度状态。
+# 限速等待发生在线程池子线程里，普通进度统计发生在主线程里，
+# 所以用一个共享状态，让“限速等待提示”也能带上当前进度。
+_CALIBRATION_PROGRESS_LOCK = threading.Lock()
+_CALIBRATION_PROGRESS = {
+    "enabled": False,
+    "finished": 0,
+    "total": 0,
+    "success_items": 0,
+    "failed_items": 0,
+    "start_time": None,
+}
+
+
+def set_calibration_progress(
+    *,
+    enabled=None,
+    finished=None,
+    total=None,
+    success_items=None,
+    failed_items=None,
+    start_time=None,
+):
+    """更新盘后校准共享进度。"""
+    with _CALIBRATION_PROGRESS_LOCK:
+        if enabled is not None:
+            _CALIBRATION_PROGRESS["enabled"] = bool(enabled)
+        if finished is not None:
+            _CALIBRATION_PROGRESS["finished"] = int(finished)
+        if total is not None:
+            _CALIBRATION_PROGRESS["total"] = int(total)
+        if success_items is not None:
+            _CALIBRATION_PROGRESS["success_items"] = int(success_items)
+        if failed_items is not None:
+            _CALIBRATION_PROGRESS["failed_items"] = int(failed_items)
+        if start_time is not None:
+            _CALIBRATION_PROGRESS["start_time"] = start_time
+
+
+def get_calibration_progress_text() -> str:
+    """生成当前盘后校准进度文本，用于限速等待时原地刷新。"""
+    with _CALIBRATION_PROGRESS_LOCK:
+        enabled = _CALIBRATION_PROGRESS.get("enabled", False)
+        finished = int(_CALIBRATION_PROGRESS.get("finished", 0) or 0)
+        total = int(_CALIBRATION_PROGRESS.get("total", 0) or 0)
+        success_items = int(_CALIBRATION_PROGRESS.get("success_items", 0) or 0)
+        failed_items = int(_CALIBRATION_PROGRESS.get("failed_items", 0) or 0)
+        start_time = _CALIBRATION_PROGRESS.get("start_time")
+
+    if not enabled or total <= 0:
+        return ""
+
+    if start_time:
+        elapsed = time.time() - start_time
+    else:
+        elapsed = 0.0
+
+    if finished > 0:
+        avg = elapsed / finished
+        remain = avg * (total - finished)
+        remain_text = f"{remain:.1f} 秒"
+    else:
+        remain_text = "计算中"
+
+    return (
+        f"进度：{finished}/{total} | "
+        f"成功周期数：{success_items} | "
+        f"失败周期数：{failed_items} | "
+        f"预计剩余：{remain_text}"
+    )
+
+
+def print_calibration_status(prefix: str):
+    """打印带当前盘后校准进度的单行状态。"""
+    progress_text = get_calibration_progress_text()
+    if progress_text:
+        print_same_line(f"{prefix} | {progress_text}")
+    else:
+        print_same_line(prefix)
+
+
+def wait_before_rt_min_call():
+    """
+    rt_min 全局限速器。
+
+    你的分钟级扫描会并发处理多只股票，并且每只股票通常会请求 5m 和 30m，
+    开启 1分钟精确买点时还会额外请求 1m。
+    rt_min 每分钟最多请求 50 次，所以这里在所有线程之间共享一个限速队列。
+    """
+
+    max_calls = max(1, int(RT_MIN_MAX_CALLS_PER_MINUTE or 45))
+
+    while True:
+        with _RT_MIN_RATE_LOCK:
+            now = time.time()
+
+            while _RT_MIN_CALL_TIMES and now - _RT_MIN_CALL_TIMES[0] >= 60:
+                _RT_MIN_CALL_TIMES.popleft()
+
+            if len(_RT_MIN_CALL_TIMES) < max_calls:
+                _RT_MIN_CALL_TIMES.append(now)
+                return
+
+            wait_seconds = 60 - (now - _RT_MIN_CALL_TIMES[0]) + 0.5
+
+        wait_seconds = max(0.5, wait_seconds)
+        print_same_line(f"rt_min 请求接近频率限制，等待 {wait_seconds:.1f} 秒后继续...")
+        time.sleep(wait_seconds)
+
+
+
+def wait_before_stk_mins_call():
+    """
+    stk_mins 全局轻量限速器。
+
+    只用于盘后校准的 stk_mins 请求，不影响盘中 rt_min 实时扫描。
+    多线程时所有线程共享一个滑动窗口，避免瞬间请求过快触发 Tushare 限频。
+    """
+
+    max_calls = max(1, int(STK_MINS_MAX_CALLS_PER_MINUTE or 80))
+
+    while True:
+        with _STK_MINS_RATE_LOCK:
+            now = time.time()
+
+            while _STK_MINS_CALL_TIMES and now - _STK_MINS_CALL_TIMES[0] >= 60:
+                _STK_MINS_CALL_TIMES.popleft()
+
+            if len(_STK_MINS_CALL_TIMES) < max_calls:
+                _STK_MINS_CALL_TIMES.append(now)
+                return
+
+            wait_seconds = 60 - (now - _STK_MINS_CALL_TIMES[0]) + 0.2
+
+        wait_seconds = max(0.2, wait_seconds)
+        print_calibration_status(f"stk_mins 请求接近频率限制，等待 {wait_seconds:.1f} 秒后继续...")
+        time.sleep(wait_seconds)
 
 
 def get_tushare_pro_cached():
@@ -90,15 +256,43 @@ def get_ts_code(code: str) -> str:
     return f"{code}.SZ"
 
 
+def get_rt_min_freq(frequency: str) -> str:
+    """把 1/5/15/30/60 转成 rt_min 要求的大写频率。"""
+    freq = str(frequency).strip().upper()
+    freq = freq.replace("MIN", "").replace("M", "")
+
+    freq_map = {
+        "1": "1MIN",
+        "5": "5MIN",
+        "15": "15MIN",
+        "30": "30MIN",
+        "60": "60MIN",
+    }
+
+    if freq not in freq_map:
+        raise ValueError(f"不支持的分钟周期：{frequency}，rt_min 只支持 1/5/15/30/60")
+
+    return freq_map[freq]
+
+
 def normalize_stk_mins_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
-    """统一 stk_mins 返回字段，输出策略层可直接使用的分钟K线字段。"""
+    """
+    统一分钟K线字段，输出策略层可直接使用的字段。
+
+    兼容两类 Tushare 返回：
+    1. stk_mins: trade_time/open/high/low/close/vol/amount
+    2. rt_min:   time/open/close/high/low/vol/amount
+
+    统一输出：datetime、开盘、最高、最低、收盘、成交量、成交额、代码
+    """
     code = str(code).zfill(6)
 
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
-    df = df.rename(columns={
+
+    rename_map = {
         "open": "开盘",
         "high": "最高",
         "low": "最低",
@@ -106,12 +300,21 @@ def normalize_stk_mins_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
         "vol": "成交量",
         "amount": "成交额",
         "trade_time": "datetime",
-    })
+        "time": "datetime",
+    }
+    df = df.rename(columns=rename_map)
 
     if "datetime" not in df.columns:
         return pd.DataFrame()
 
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    # rt_min 正常返回是 "YYYY-MM-DD HH:MM:SS"，这里兼容只有 HH:MM:SS 的情况。
+    dt_text = df["datetime"].astype(str)
+    only_time_mask = dt_text.str.match(r"^\d{2}:\d{2}:\d{2}$", na=False)
+    if only_time_mask.any():
+        today = datetime.now().strftime("%Y-%m-%d")
+        dt_text.loc[only_time_mask] = today + " " + dt_text.loc[only_time_mask]
+
+    df["datetime"] = pd.to_datetime(dt_text, errors="coerce")
     df = df.dropna(subset=["datetime"])
     df["代码"] = code
 
@@ -128,77 +331,280 @@ def normalize_stk_mins_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
     return df
 
 
-def fetch_stk_mins(code: str, frequency: str, days: int = DEFAULT_MINUTE_DAYS) -> pd.DataFrame:
+def fetch_rt_min(code: str, frequency: str) -> pd.DataFrame:
     """
-    直接用 stk_mins 拉取最近 days 天历史分钟K线。
-    这个函数不读取旧缓存，主要给盘后校准使用。
+    使用 Tushare rt_min 获取盘中实时分钟K线。
+
+    注意：rt_min 通常返回当天已经形成的分钟K线。
+    为了让 30分钟结构判断有足够K线，load_tushare_minute() 会把 rt_min
+    返回结果追加到 cache/minute 的历史缓存中，再统一保留最近 minute_days 天。
+    """
+    code = str(code).zfill(6)
+    pro = get_tushare_pro_cached()
+    freq = get_rt_min_freq(frequency)
+
+    # 全局限速，避免并发扫描时超过 rt_min 每分钟 50 次请求限制。
+    wait_before_rt_min_call()
+
+    df_new = pro.rt_min(
+        ts_code=get_ts_code(code),
+        freq=freq,
+    )
+
+    return normalize_stk_mins_df(df_new, code)
+
+
+def get_stk_mins_freq(frequency: str) -> str:
+    """把 1/5/15/30/60 转成 stk_mins 要求的频率。"""
+    freq = str(frequency).strip().lower()
+    freq = freq.replace("min", "").replace("m", "")
+    if freq not in {"1", "5", "15", "30", "60"}:
+        raise ValueError(f"不支持的分钟周期：{frequency}，stk_mins 只支持 1/5/15/30/60")
+    return f"{freq}min"
+
+
+def format_stk_mins_dt(value) -> str:
+    """stk_mins start_date/end_date 使用 datetime 字符串格式。"""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        dt = datetime.now()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_frequency_minutes(frequency: str) -> int:
+    """把分钟周期转成整数分钟。"""
+    freq = str(frequency).strip().lower().replace("min", "").replace("m", "")
+    try:
+        return int(freq)
+    except Exception:
+        return 5
+
+
+def is_cache_updated_after_market(latest_dt, frequency: str) -> bool:
+    """
+    判断本地缓存是否已经更新到今天收盘附近。
+
+    对 1m/5m/30m 都统一用 14:55 作为盘后判断阈值，避免因为最后一根K线时间
+    在不同数据源里显示为 14:55、15:00 造成反复请求。
+    """
+    if pd.isna(latest_dt):
+        return False
+
+    latest_dt = pd.to_datetime(latest_dt, errors="coerce")
+    if pd.isna(latest_dt):
+        return False
+
+    now = datetime.now()
+    if latest_dt.date() < now.date():
+        return False
+
+    close_check_time = datetime.strptime("14:55", "%H:%M").time()
+    return latest_dt.time() >= close_check_time
+
+
+def fetch_stk_mins(
+    code: str,
+    frequency: str,
+    days: int = DEFAULT_MINUTE_DAYS,
+    start_dt=None,
+    end_dt=None,
+) -> pd.DataFrame:
+    """
+    使用 stk_mins 拉取历史分钟K线。
+
+    - start_dt/end_dt 为空：拉最近 days 天。
+    - start_dt/end_dt 不为空：按指定 datetime 区间拉取，用于盘后增量更新。
+    - 带轻量限速和“请求速度过快”自动重试。
     """
     code = str(code).zfill(6)
     frequency = str(frequency)
     pro = get_tushare_pro_cached()
 
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    end_date = datetime.now().strftime("%Y%m%d")
+    if start_dt is None:
+        start_dt = datetime.now() - timedelta(days=days)
+    if end_dt is None:
+        end_dt = datetime.now()
 
-    df_new = pro.stk_mins(
-        ts_code=get_ts_code(code),
-        asset="E",
-        start_date=start_date,
-        end_date=end_date,
-        freq=f"{frequency}min",
-    )
+    start_date = format_stk_mins_dt(start_dt)
+    end_date = format_stk_mins_dt(end_dt)
+    freq = get_stk_mins_freq(frequency)
 
-    df_new = normalize_stk_mins_df(df_new, code)
-    if df_new.empty:
-        return pd.DataFrame()
+    last_error = ""
+    retry_times = max(0, int(STK_MINS_RETRY_TIMES or 0))
 
-    cutoff = datetime.now() - timedelta(days=days)
-    df_new = df_new[df_new["datetime"] >= cutoff].copy()
-    df_new = df_new.sort_values("datetime").reset_index(drop=True)
+    for attempt in range(retry_times + 1):
+        try:
+            wait_before_stk_mins_call()
 
-    return df_new
+            df_new = pro.stk_mins(
+                ts_code=get_ts_code(code),
+                asset="E",
+                start_date=start_date,
+                end_date=end_date,
+                freq=freq,
+            )
+
+            df_new = normalize_stk_mins_df(df_new, code)
+            if df_new.empty:
+                return pd.DataFrame()
+
+            cutoff = datetime.now() - timedelta(days=days)
+            df_new = df_new[df_new["datetime"] >= cutoff].copy()
+            df_new = df_new.sort_values("datetime").reset_index(drop=True)
+
+            return df_new
+
+        except Exception as e:
+            last_error = str(e)
+            is_rate_error = "请求速度过快" in last_error or "频率" in last_error or "rate" in last_error.lower()
+
+            if is_rate_error and attempt < retry_times:
+                sleep_seconds = STK_MINS_RETRY_SLEEP_SECONDS * (attempt + 1)
+                print_calibration_status(
+                    f"{code} {frequency}m stk_mins 请求过快，"
+                    f"等待 {sleep_seconds:.1f} 秒后重试 {attempt + 1}/{retry_times}..."
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            raise Exception(last_error)
+
+    return pd.DataFrame()
 
 
 def overwrite_stk_mins_cache(code: str, frequency: str, days: int = DEFAULT_MINUTE_DAYS) -> dict:
     """
-    盘后校准：用 stk_mins 重新拉最近 days 天数据，并直接覆盖本地分钟缓存文件。
-    注意：这是“覆盖校准”，不是增量追加。
+    盘后校准：使用 stk_mins 增量更新本地分钟缓存。
+
+    说明：保留函数名是为了不改 realtime_strategy.py 的调用链。
+    现在不再全量覆盖，而是：
+    1. 读取 cache/minute/{代码}_{周期}m.csv
+    2. 找到本地最新 datetime
+    3. 如果已更新到今天收盘附近，直接跳过请求
+    4. 否则从最新时间前推一个周期开始拉取，合并去重
+    5. 只保留最近 days 天，写回 csv
     """
     code = str(code).zfill(6)
     frequency = str(frequency)
     cache_file = os.path.join(MINUTE_CACHE_DIR, f"{code}_{frequency}m.csv")
     os.makedirs(MINUTE_CACHE_DIR, exist_ok=True)
 
+    old_df = pd.DataFrame()
+    if os.path.exists(cache_file):
+        try:
+            old_df = pd.read_csv(cache_file, dtype={"代码": str})
+            old_df["datetime"] = pd.to_datetime(old_df["datetime"], errors="coerce")
+            old_df = old_df.dropna(subset=["datetime"])
+            old_df = old_df.drop_duplicates(subset=["datetime"], keep="last")
+            old_df = old_df.sort_values("datetime")
+
+            cutoff = datetime.now() - timedelta(days=days)
+            old_df = old_df[old_df["datetime"] >= cutoff].copy()
+        except Exception:
+            old_df = pd.DataFrame()
+
+    latest_dt = old_df["datetime"].max() if not old_df.empty else pd.NaT
+
+    if not old_df.empty and is_cache_updated_after_market(latest_dt, frequency):
+        return {
+            "success": True,
+            "code": code,
+            "frequency": frequency,
+            "rows": len(old_df),
+            "new_rows": 0,
+            "update_mode": "skip",
+            "latest_dt": latest_dt,
+            "cache_file": cache_file,
+            "error": "已更新到今天收盘附近，跳过请求",
+        }
+
     try:
-        df = fetch_stk_mins(code, frequency, days=days)
-        if df is None or df.empty:
+        freq_minutes = get_frequency_minutes(frequency)
+
+        if old_df.empty or pd.isna(latest_dt):
+            # 无缓存：拉最近 days 天。
+            start_dt = datetime.now() - timedelta(days=days)
+            update_mode = "init"
+            old_count = 0
+        else:
+            # 有缓存：从最新时间前推一个周期开始拉，避免边界漏K线；重复数据后续去重。
+            start_dt = pd.to_datetime(latest_dt) - timedelta(minutes=max(1, freq_minutes))
+            update_mode = "incremental"
+            old_count = len(old_df)
+
+        end_dt = datetime.now()
+        df_new = fetch_stk_mins(code, frequency, days=days, start_dt=start_dt, end_dt=end_dt)
+
+        if df_new is None or df_new.empty:
+            if not old_df.empty:
+                return {
+                    "success": True,
+                    "code": code,
+                    "frequency": frequency,
+                    "rows": len(old_df),
+                    "new_rows": 0,
+                    "update_mode": "no_new",
+                    "latest_dt": latest_dt,
+                    "cache_file": cache_file,
+                    "error": "stk_mins 增量返回为空，保留旧缓存",
+                }
+
             return {
                 "success": False,
                 "code": code,
                 "frequency": frequency,
                 "rows": 0,
+                "new_rows": 0,
+                "update_mode": "error",
+                "latest_dt": pd.NaT,
                 "cache_file": cache_file,
-                "error": "stk_mins 返回为空",
+                "error": "stk_mins 返回为空，且本地无缓存",
             }
 
+        if not old_df.empty:
+            df = pd.concat([old_df, df_new], ignore_index=True)
+        else:
+            df = df_new
+
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["datetime"])
+        df = df.drop_duplicates(subset=["datetime"], keep="last")
+        df = df.sort_values("datetime")
+
+        cutoff = datetime.now() - timedelta(days=days)
+        df = df[df["datetime"] >= cutoff].copy()
+
         df.to_csv(cache_file, index=False, encoding="utf-8-sig")
-        latest_dt = df["datetime"].max()
+        latest_after = df["datetime"].max() if not df.empty else pd.NaT
+
+        if old_df.empty:
+            new_rows = len(df)
+        else:
+            old_times = set(pd.to_datetime(old_df["datetime"], errors="coerce").dropna().astype(str).tolist())
+            new_times = set(pd.to_datetime(df["datetime"], errors="coerce").dropna().astype(str).tolist())
+            new_rows = max(0, len(new_times - old_times))
 
         return {
             "success": True,
             "code": code,
             "frequency": frequency,
             "rows": len(df),
-            "latest_dt": latest_dt,
+            "new_rows": int(new_rows),
+            "update_mode": update_mode,
+            "latest_dt": latest_after,
             "cache_file": cache_file,
             "error": "",
         }
+
     except Exception as e:
         return {
             "success": False,
             "code": code,
             "frequency": frequency,
-            "rows": 0,
+            "rows": len(old_df),
+            "new_rows": 0,
+            "update_mode": "error",
+            "latest_dt": latest_dt,
             "cache_file": cache_file,
             "error": str(e),
         }
@@ -233,8 +639,8 @@ def calibrate_minute_cache_after_market(
     """
     盘后分钟缓存校准入口。
 
-    默认只校准 5m / 30m，因为当前默认关闭 1分钟精确买点。
-    如果 include_1m=True，则同时覆盖校准 1m / 5m / 30m。
+    默认校准 1m / 5m / 30m。
+    include_1m 参数保留兼容旧调用，但当前盘后校准默认已经包含 1m。
     """
     if stock_df is None or stock_df.empty:
         print("盘后分钟校准：股票池为空，跳过。")
@@ -246,9 +652,8 @@ def calibrate_minute_cache_after_market(
     if max_stocks and max_stocks > 0:
         df = df.head(max_stocks).copy()
 
-    frequencies = ["5", "30"]
-    if include_1m:
-        frequencies = ["1", "5", "30"]
+    # 盘后校准默认直接更新 1m / 5m / 30m，不再需要额外开关。
+    frequencies = ["1", "5", "30"]
 
     total = len(df)
     max_workers = max(1, int(max_workers or 1))
@@ -260,10 +665,25 @@ def calibrate_minute_cache_after_market(
         f"周期：{','.join(f + 'm' for f in frequencies)}，"
         f"范围：最近 {minute_days} 天，并发数：{max_workers}"
     )
-    print("说明：本操作使用 stk_mins 重新拉取历史分钟K线，并覆盖 cache/minute 下对应 csv。")
+    print(
+        "说明：本操作使用 stk_mins 从本地缓存最新时间开始增量拉取，"
+        "并与 cache/minute 下对应 csv 合并去重。"
+    )
+    print(
+        f"限速：stk_mins 默认每分钟最多 {STK_MINS_MAX_CALLS_PER_MINUTE} 次请求，"
+        "可通过环境变量 STK_MINS_MAX_CALLS_PER_MINUTE 调整。"
+    )
 
     result_rows = []
     start_time = time.time()
+    set_calibration_progress(
+        enabled=True,
+        finished=0,
+        total=total,
+        success_items=0,
+        failed_items=0,
+        start_time=start_time,
+    )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
@@ -298,6 +718,8 @@ def calibrate_minute_cache_after_market(
                             "code": code,
                             "frequency": f,
                             "rows": 0,
+                            "new_rows": 0,
+                            "update_mode": "error",
                             "latest_dt": pd.NaT,
                             "cache_file": "",
                             "error": str(e),
@@ -317,25 +739,29 @@ def calibrate_minute_cache_after_market(
                     "周期": f"{detail.get('frequency', '')}m",
                     "是否成功": bool(detail.get("success")),
                     "数据行数": int(detail.get("rows", 0) or 0),
+                    "新增行数": int(detail.get("new_rows", 0) or 0),
+                    "更新方式": detail.get("update_mode", ""),
                     "最新时间": detail.get("latest_dt", ""),
                     "缓存文件": detail.get("cache_file", ""),
                     "错误信息": detail.get("error", ""),
                 })
 
+            set_calibration_progress(
+                finished=finished,
+                success_items=success_items,
+                failed_items=failed_items,
+            )
+
             if finished % 5 == 0 or finished == total:
                 elapsed = time.time() - start_time
                 avg = elapsed / finished if finished else 0
                 remain = avg * (total - finished)
-                print(
-                    f"盘后校准进度：{finished}/{total} | "
-                    f"成功周期数：{success_items} | "
-                    f"失败周期数：{failed_items} | "
-                    f"预计剩余：{remain:.1f} 秒",
-                    end="\r",
-                    flush=True,
+                print_calibration_status(
+                    f"盘后校准进度：{finished}/{total}"
                 )
 
     print()
+    set_calibration_progress(enabled=False)
 
     result_df = pd.DataFrame(result_rows)
     os.makedirs("output/minute_calibration", exist_ok=True)
@@ -366,12 +792,12 @@ def load_tushare_minute(
     force_update: bool = False,
 ) -> pd.DataFrame:
     """
-    读取或增量更新 Tushare 历史分钟 K 线。
+    读取或增量更新 Tushare rt_min 实时分钟 K 线。
     支持文件缓存，格式：000001_1m.csv / 000001_5m.csv / 000001_30m.csv
 
     force_update=True 时：
-    - 不管当前是否交易时间，都尝试请求 Tushare stk_mins；
-    - 用于提前验证 5分钟/30分钟 B点扫描速度；
+    - 不管当前是否交易时间，都尝试请求 Tushare rt_min；
+    - 用于提前验证 1分钟/5分钟/30分钟 B点扫描速度；
     - 仍然会和本地缓存合并、去重、只保留最近 days 天，不会让文件无限变大。
     """
     code = str(code).zfill(6)
@@ -422,36 +848,17 @@ def load_tushare_minute(
                 if latest_dt >= now - timedelta(minutes=allow_lag_minutes):
                     return old_df.sort_values("datetime")
 
-            # 如果缓存明显落后，就继续请求接口补数据。
-            # Tushare stk_mins 只能按日期请求，所以这里仍然从最新缓存日期开始拉，
-            # 后面靠 drop_duplicates 去重。
-            if pd.notna(latest_dt):
-                start_date = latest_dt.strftime("%Y%m%d")
-            else:
-                start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+            # 如果缓存明显落后，就继续请求 rt_min 补当天实时分钟数据。
         else:
-            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+            pass
     else:
-        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-
-    # Tushare Pro 初始化复用全局对象，避免每个周期重复初始化。
-    pro = get_tushare_pro_cached()
-
-    end_date = datetime.now().strftime("%Y%m%d")
+        pass
 
     try:
-        # Tushare stk_mins 获取历史分钟数据
-        df_new = pro.stk_mins(ts_code=f"{code}.SZ" if code.startswith("0") else f"{code}.SH",
-                              asset="E",
-                              start_date=start_date,
-                              end_date=end_date,
-                              freq=frequency + "min")
-        if df_new.empty:
-            return old_df
-
-        # 统一列名
-        df_new = normalize_stk_mins_df(df_new, code)
-        if df_new.empty:
+        # Tushare rt_min 获取盘中实时分钟数据。
+        # rt_min 不需要 start_date/end_date，只需要 ts_code + 大写 freq。
+        df_new = fetch_rt_min(code, frequency)
+        if df_new is None or df_new.empty:
             return old_df
 
         # 合并增量
@@ -468,7 +875,7 @@ def load_tushare_minute(
         df.to_csv(cache_file, index=False, encoding="utf-8-sig")
         return df
     except Exception as e:
-        print(f"{code} Tushare 分钟数据获取失败：{e}")
+        print(f"{code} Tushare rt_min 分钟数据获取失败：{e}")
         return old_df
 
 # =========================
@@ -786,7 +1193,7 @@ def scan_minute_buy_points(
     max_workers = min(max_workers, total)
     minute_days = int(minute_days or DEFAULT_MINUTE_DAYS)
 
-    update_mode = "强制请求stk_mins" if force_update_minute else "优先使用本地缓存"
+    update_mode = "强制请求rt_min" if force_update_minute else "优先使用本地缓存，盘中用rt_min增量更新"
     print(
         f"\n开始分钟级B点确认：候选股票 {total} 只，"
         f"分钟数据范围：最近 {minute_days} 天，并发数：{max_workers}，"
@@ -838,13 +1245,11 @@ def scan_minute_buy_points(
                 elapsed = time.time() - start_time
                 avg = elapsed / finished if finished else 0
                 remain = avg * (total - finished)
-                print(
+                print_same_line(
                     f"分钟级确认进度：{finished}/{total} | "
                     f"B点数：{len(result_list)} | "
                     f"失败数：{failed_count} | "
-                    f"预计剩余：{remain:.1f} 秒",
-                    end="\r",
-                    flush=True,
+                    f"预计剩余：{remain:.1f} 秒"
                 )
 
     print()

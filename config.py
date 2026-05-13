@@ -7,10 +7,10 @@ import os
 # =========================
 # 为了避免把 Token 上传到 GitHub，优先读取环境变量 TUSHARE_TOKEN。
 # 如果你只是本地测试，也可以把下面的“这里填你的token”替换成自己的 token。
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "xxx")
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "OaZRxcERYuAvUoZyhzJkwlvfbDvMSRtDlmLMvMUDzbCykDxYZHIuFMAlWXunwvev")
 
 # 你购买的 Tushare 代理地址
-TUSHARE_HTTP_URL = os.getenv("TUSHARE_HTTP_URL", "xxx")
+TUSHARE_HTTP_URL = os.getenv("TUSHARE_HTTP_URL", "http://8.136.22.187:8011/")
 
 # =========================
 # 基础股票池筛选条件
